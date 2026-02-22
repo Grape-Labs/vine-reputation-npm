@@ -1,7 +1,7 @@
 {
   "name": "@grapenpm/vine-reputation-client",
-  "version": "0.1.32",
-  "description": "Composable client for the Grape Vine Reputation Solana program",
+  "version": "0.1.37",
+  "description": "Composable client for the OG Reputation Solana program",
   "license": "MIT",
   "main": "dist/index.cjs",
   "module": "dist/index.mjs",

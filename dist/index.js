@@ -32,29 +32,36 @@ var index_exports = {};
 __export(index_exports, {
   VINE_REP_PROGRAM_ID: () => VINE_REP_PROGRAM_ID,
   accountDiscriminator: () => accountDiscriminator,
+  buildAddDelegateIx: () => buildAddDelegateIx,
   buildAddReputationIx: () => buildAddReputationIx,
   buildAddReputationPointsIx: () => buildAddReputationPointsIx,
   buildAdminCloseAnyIx: () => buildAdminCloseAnyIx,
   buildCloseConfigIx: () => buildCloseConfigIx,
   buildCloseReputationIx: () => buildCloseReputationIx,
   buildInitializeConfigIx: () => buildInitializeConfigIx,
+  buildRemoveDelegateIx: () => buildRemoveDelegateIx,
   buildResetReputationIx: () => buildResetReputationIx,
   buildSetAuthorityIx: () => buildSetAuthorityIx,
   buildSetDecayBpsIx: () => buildSetDecayBpsIx,
   buildSetRepMintIx: () => buildSetRepMintIx,
   buildSetSeasonIx: () => buildSetSeasonIx,
   buildTransferReputationIx: () => buildTransferReputationIx,
+  buildUpdateDelegateIx: () => buildUpdateDelegateIx,
   buildUpsertProjectMetadataIx: () => buildUpsertProjectMetadataIx,
+  decodeDelegate: () => decodeDelegate,
   decodeProjectMetadata: () => decodeProjectMetadata,
   decodeReputation: () => decodeReputation,
   decodeReputationConfig: () => decodeReputationConfig,
   discHex: () => discHex,
   fetchAllSpaces: () => fetchAllSpaces,
+  fetchAllSpacesGPA: () => fetchAllSpacesGPA,
   fetchConfig: () => fetchConfig,
+  fetchDelegate: () => fetchDelegate,
   fetchProjectMetadata: () => fetchProjectMetadata,
   fetchReputation: () => fetchReputation,
   fetchReputationsForDaoSeason: () => fetchReputationsForDaoSeason,
   getConfigPda: () => getConfigPda,
+  getDelegatePda: () => getDelegatePda,
   getProjectMetaPda: () => getProjectMetaPda,
   getReputationPda: () => getReputationPda,
   ixDiscriminator: () => ixDiscriminator
@@ -455,6 +462,12 @@ function getReputationPda(configPda, user, season, programId = VINE_REP_PROGRAM_
     programId
   );
 }
+function getDelegatePda(configPda, delegateWallet, programId = VINE_REP_PROGRAM_ID) {
+  return import_web3.PublicKey.findProgramAddressSync(
+    [utf8("delegate"), configPda.toBytes(), delegateWallet.toBytes()],
+    programId
+  );
+}
 var discCache = /* @__PURE__ */ new Map();
 function camelToSnake(s) {
   return s.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/__/g, "_").toLowerCase();
@@ -471,6 +484,12 @@ function ixNameOnChain(ix) {
       return "set_decay_bps";
     case "setRepMint":
       return "set_rep_mint";
+    case "addDelegate":
+      return "add_delegate";
+    case "updateDelegate":
+      return "update_delegate";
+    case "removeDelegate":
+      return "remove_delegate";
     case "addReputation":
       return "add_reputation";
     case "resetReputation":
@@ -582,6 +601,29 @@ async function decodeProjectMetadata(dataIn) {
   o += 1;
   return { version, daoId, metadataUri, bump };
 }
+async function decodeDelegate(dataIn) {
+  const data = toU8(dataIn);
+  const disc = await accountDiscriminator("Delegate");
+  if (data.length < 8) throw new Error("Delegate data too small");
+  if (!u8eq(data.subarray(0, 8), disc)) {
+    throw new Error("Not a Delegate account (bad discriminator)");
+  }
+  if (data.length < 78) throw new RangeError("Delegate data out of bounds");
+  let o = 8;
+  const version = data[o];
+  o += 1;
+  const config = new import_web3.PublicKey(data.subarray(o, o + 32));
+  o += 32;
+  const delegate = new import_web3.PublicKey(data.subarray(o, o + 32));
+  o += 32;
+  const canAward = data[o] !== 0;
+  o += 1;
+  const canReset = data[o] !== 0;
+  o += 1;
+  const bump = data[o];
+  o += 1;
+  return { version, config, delegate, canAward, canReset, bump };
+}
 async function fetchConfig(conn, daoId) {
   const [configPda] = getConfigPda(daoId);
   const ai = await conn.getAccountInfo(configPda);
@@ -601,7 +643,53 @@ async function fetchReputation(conn, daoId, user, season) {
   if (!ai?.data) return null;
   return decodeReputation(ai.data);
 }
+async function fetchDelegate(conn, configPda, delegateWallet) {
+  const [delegatePda] = getDelegatePda(configPda, delegateWallet);
+  const ai = await conn.getAccountInfo(delegatePda);
+  if (!ai?.data) return null;
+  return decodeDelegate(ai.data);
+}
 async function fetchAllSpaces(conn, programId = VINE_REP_PROGRAM_ID) {
+  const disc = await accountDiscriminator("ReputationConfig");
+  const disc58 = import_bs58.default.encode(disc);
+  const cfg = {
+    encoding: "base64",
+    filters: [
+      { dataSize: 113 },
+      // ✅ 8 + ReputationConfig::SIZE (105)
+      { memcmp: { offset: 0, bytes: disc58 } }
+    ]
+  };
+  const accts = await conn.getProgramAccounts(programId, cfg);
+  const out = [];
+  for (const a of accts) {
+    try {
+      const raw = a.account.data;
+      if (!raw || raw.length < 8) continue;
+      const cfgAcct = await decodeReputationConfig(raw);
+      const [expected] = getConfigPda(cfgAcct.daoId, programId);
+      if (!expected.equals(a.pubkey)) continue;
+      out.push({
+        version: cfgAcct.version,
+        daoId: cfgAcct.daoId,
+        authority: cfgAcct.authority,
+        repMint: cfgAcct.repMint,
+        currentSeason: cfgAcct.currentSeason,
+        decayBps: cfgAcct.decayBps,
+        configPda: a.pubkey
+      });
+    } catch {
+    }
+  }
+  const byDao = /* @__PURE__ */ new Map();
+  for (const s of out) {
+    const k = s.daoId.toBase58();
+    const prev = byDao.get(k);
+    if (!prev || s.currentSeason > prev.currentSeason) byDao.set(k, s);
+  }
+  return Array.from(byDao.values());
+}
+async function fetchAllSpacesGPA(conn, programId = VINE_REP_PROGRAM_ID) {
   const accts = await conn.getProgramAccounts(programId);
   const disc = await accountDiscriminator("ReputationConfig");
   const out = [];
@@ -745,6 +833,65 @@ async function buildSetRepMintIx(args) {
     keys: [
       { pubkey: configPda, isSigner: false, isWritable: true },
       { pubkey: args.authority, isSigner: true, isWritable: false }
+    ],
+    data: import_buffer.Buffer.from(data)
+  });
+}
+async function buildAddDelegateIx(args) {
+  const programId = args.programId ?? VINE_REP_PROGRAM_ID;
+  const disc = await ixDiscriminator("addDelegate");
+  const data = new Uint8Array(8 + 1 + 1);
+  data.set(disc, 0);
+  data[8] = args.canAward ? 1 : 0;
+  data[9] = args.canReset ? 1 : 0;
+  const [configPda] = getConfigPda(args.daoId, programId);
+  const [delegatePda] = getDelegatePda(configPda, args.delegateWallet, programId);
+  return new import_web3.TransactionInstruction({
+    programId,
+    keys: [
+      { pubkey: configPda, isSigner: false, isWritable: false },
+      { pubkey: args.authority, isSigner: true, isWritable: false },
+      { pubkey: args.delegateWallet, isSigner: false, isWritable: false },
+      { pubkey: delegatePda, isSigner: false, isWritable: true },
+      { pubkey: args.payer, isSigner: true, isWritable: true },
+      { pubkey: import_web3.SystemProgram.programId, isSigner: false, isWritable: false }
+    ],
+    data: import_buffer.Buffer.from(data)
+  });
+}
+async function buildUpdateDelegateIx(args) {
+  const programId = args.programId ?? VINE_REP_PROGRAM_ID;
+  const disc = await ixDiscriminator("updateDelegate");
+  const data = new Uint8Array(8 + 1 + 1);
+  data.set(disc, 0);
+  data[8] = args.canAward ? 1 : 0;
+  data[9] = args.canReset ? 1 : 0;
+  const [configPda] = getConfigPda(args.daoId, programId);
+  const [delegatePda] = getDelegatePda(configPda, args.delegateWallet, programId);
+  return new import_web3.TransactionInstruction({
+    programId,
+    keys: [
+      { pubkey: configPda, isSigner: false, isWritable: false },
+      { pubkey: args.authority, isSigner: true, isWritable: false },
+      { pubkey: delegatePda, isSigner: false, isWritable: true }
+    ],
+    data: import_buffer.Buffer.from(data)
+  });
+}
+async function buildRemoveDelegateIx(args) {
+  const programId = args.programId ?? VINE_REP_PROGRAM_ID;
+  const disc = await ixDiscriminator("removeDelegate");
+  const data = new Uint8Array(8);
+  data.set(disc, 0);
+  const [configPda] = getConfigPda(args.daoId, programId);
+  const [delegatePda] = getDelegatePda(configPda, args.delegateWallet, programId);
+  return new import_web3.TransactionInstruction({
+    programId,
+    keys: [
+      { pubkey: configPda, isSigner: false, isWritable: false },
+      { pubkey: args.authority, isSigner: true, isWritable: false },
+      { pubkey: delegatePda, isSigner: false, isWritable: true },
+      { pubkey: args.recipient, isSigner: false, isWritable: true }
     ],
     data: import_buffer.Buffer.from(data)
   });
@@ -1011,8 +1158,21 @@ async function buildTransferReputationIx(args) {
   const data = new Uint8Array(8);
   data.set(disc, 0);
   const [configPda] = getConfigPda(args.daoId, programId);
-  const [repFrom] = getReputationPda(configPda, args.oldWallet, args.season, programId);
-  const [repTo] = getReputationPda(configPda, args.newWallet, args.season, programId);
+  const ai = await args.conn.getAccountInfo(configPda);
+  if (!ai?.data) throw new Error("Config PDA not found for this DAO.");
+  const cfg = await decodeReputationConfig(ai.data);
+  const cfgSeason = Number(cfg.currentSeason);
+  if (!Number.isFinite(cfgSeason) || cfgSeason < 0 || cfgSeason > 65535) {
+    throw new Error(`Invalid config.currentSeason: ${cfgSeason}`);
+  }
+  const season = args.season == null ? cfgSeason : Number(args.season);
+  if (season !== cfgSeason) {
+    throw new Error(
+      `SeasonMismatch (client): provided season=${season} but config.currentSeason=${cfgSeason}`
+    );
+  }
+  const [repFrom] = getReputationPda(configPda, args.oldWallet, season, programId);
+  const [repTo] = getReputationPda(configPda, args.newWallet, season, programId);
   return new import_web3.TransactionInstruction({
     programId,
     keys: [
@@ -1048,29 +1208,36 @@ async function buildCloseConfigIx(args) {
 0 && (module.exports = {
   VINE_REP_PROGRAM_ID,
   accountDiscriminator,
+  buildAddDelegateIx,
   buildAddReputationIx,
   buildAddReputationPointsIx,
   buildAdminCloseAnyIx,
   buildCloseConfigIx,
   buildCloseReputationIx,
   buildInitializeConfigIx,
+  buildRemoveDelegateIx,
   buildResetReputationIx,
   buildSetAuthorityIx,
   buildSetDecayBpsIx,
   buildSetRepMintIx,
   buildSetSeasonIx,
   buildTransferReputationIx,
+  buildUpdateDelegateIx,
   buildUpsertProjectMetadataIx,
+  decodeDelegate,
   decodeProjectMetadata,
   decodeReputation,
   decodeReputationConfig,
   discHex,
   fetchAllSpaces,
+  fetchAllSpacesGPA,
   fetchConfig,
+  fetchDelegate,
   fetchProjectMetadata,
   fetchReputation,
   fetchReputationsForDaoSeason,
   getConfigPda,
+  getDelegatePda,
   getProjectMetaPda,
   getReputationPda,
   ixDiscriminator

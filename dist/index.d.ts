@@ -17,6 +17,11 @@ declare function getProjectMetaPda(daoId: PublicKey, programId?: PublicKey): [Pu
  * ["reputation", configPda, user, season(u16le)]
  */
 declare function getReputationPda(configPda: PublicKey, user: PublicKey, season: number, programId?: PublicKey): [PublicKey, number];
+/**
+ * delegate PDA:
+ * ["delegate", configPda, delegateWallet]
+ */
+declare function getDelegatePda(configPda: PublicKey, delegateWallet: PublicKey, programId?: PublicKey): [PublicKey, number];
 declare function ixDiscriminator(idlIxName: string): Promise<Uint8Array>;
 declare function accountDiscriminator(accountName: string): Promise<Uint8Array>;
 declare function discHex(d: Uint8Array): string;
@@ -48,14 +53,23 @@ type ProjectMetadataAccount = {
     metadataUri: string;
     bump: number;
 };
+type DelegateAccount = {
+    version: number;
+    config: PublicKey;
+    delegate: PublicKey;
+    canAward: boolean;
+    canReset: boolean;
+    bump: number;
+};
 /**
  * -----------------------------
- * Decoders (your existing ones are fine)
+ * Decoders
  * -----------------------------
  */
 declare function decodeReputationConfig(dataIn: Uint8Array | Buffer): Promise<ReputationConfigAccount>;
 declare function decodeReputation(dataIn: Uint8Array | Buffer): Promise<ReputationAccount>;
 declare function decodeProjectMetadata(dataIn: Uint8Array | Buffer): Promise<ProjectMetadataAccount>;
+declare function decodeDelegate(dataIn: Uint8Array | Buffer): Promise<DelegateAccount>;
 /**
  * -----------------------------
  * Fetch helpers
@@ -64,6 +78,7 @@ declare function decodeProjectMetadata(dataIn: Uint8Array | Buffer): Promise<Pro
 declare function fetchConfig(conn: Connection, daoId: PublicKey): Promise<ReputationConfigAccount | null>;
 declare function fetchProjectMetadata(conn: Connection, daoId: PublicKey): Promise<ProjectMetadataAccount | null>;
 declare function fetchReputation(conn: Connection, daoId: PublicKey, user: PublicKey, season: number): Promise<ReputationAccount | null>;
+declare function fetchDelegate(conn: Connection, configPda: PublicKey, delegateWallet: PublicKey): Promise<DelegateAccount | null>;
 /**
  * -----------------------------
  * Space discovery (SAFE + composable)
@@ -81,10 +96,10 @@ type VineSpace = {
     configPda: PublicKey;
 };
 declare function fetchAllSpaces(conn: Connection, programId?: PublicKey): Promise<VineSpace[]>;
+declare function fetchAllSpacesGPA(conn: Connection, programId?: PublicKey): Promise<VineSpace[]>;
 /**
  * -----------------------------
  * Instruction builders
- * (NO CHANGE needed besides fixed ixDiscriminator above)
  * -----------------------------
  */
 declare function buildInitializeConfigIx(args: {
@@ -102,10 +117,6 @@ declare function buildUpsertProjectMetadataIx(args: {
     metadataUri: string;
     programId?: PublicKey;
 }): Promise<TransactionInstruction>;
-/**
- * Keep the rest of your builders exactly as-is.
- * They will start working once ixDiscriminator() hashes the on-chain snake_case name.
- */
 declare function buildSetAuthorityIx(args: {
     daoId: PublicKey;
     authority: PublicKey;
@@ -130,6 +141,40 @@ declare function buildSetRepMintIx(args: {
     newRepMint: PublicKey;
     programId?: PublicKey;
 }): Promise<TransactionInstruction>;
+/**
+ * -----------------------------
+ * Delegate instruction builders
+ * -----------------------------
+ */
+declare function buildAddDelegateIx(args: {
+    daoId: PublicKey;
+    authority: PublicKey;
+    delegateWallet: PublicKey;
+    canAward: boolean;
+    canReset: boolean;
+    payer: PublicKey;
+    programId?: PublicKey;
+}): Promise<TransactionInstruction>;
+declare function buildUpdateDelegateIx(args: {
+    daoId: PublicKey;
+    authority: PublicKey;
+    delegateWallet: PublicKey;
+    canAward: boolean;
+    canReset: boolean;
+    programId?: PublicKey;
+}): Promise<TransactionInstruction>;
+declare function buildRemoveDelegateIx(args: {
+    daoId: PublicKey;
+    authority: PublicKey;
+    delegateWallet: PublicKey;
+    recipient: PublicKey;
+    programId?: PublicKey;
+}): Promise<TransactionInstruction>;
+/**
+ * -----------------------------
+ * Reputation instruction builders
+ * -----------------------------
+ */
 type RepRow = {
     pubkey: PublicKey;
     user: PublicKey;
@@ -207,12 +252,13 @@ declare function buildAdminCloseAnyIx(args: {
     programId?: PublicKey;
 }): Promise<TransactionInstruction>;
 declare function buildTransferReputationIx(args: {
+    conn: Connection;
     daoId: PublicKey;
     authority: PublicKey;
     payer: PublicKey;
     oldWallet: PublicKey;
     newWallet: PublicKey;
-    season: number;
+    season?: number;
     programId?: PublicKey;
 }): Promise<TransactionInstruction>;
 declare function buildCloseConfigIx(args: {
@@ -222,4 +268,4 @@ declare function buildCloseConfigIx(args: {
     programId?: PublicKey;
 }): Promise<TransactionInstruction>;
 
-export { type ProjectMetadataAccount, type RepRow, type ReputationAccount, type ReputationConfigAccount, VINE_REP_PROGRAM_ID, type VineSpace, accountDiscriminator, buildAddReputationIx, buildAddReputationPointsIx, buildAdminCloseAnyIx, buildCloseConfigIx, buildCloseReputationIx, buildInitializeConfigIx, buildResetReputationIx, buildSetAuthorityIx, buildSetDecayBpsIx, buildSetRepMintIx, buildSetSeasonIx, buildTransferReputationIx, buildUpsertProjectMetadataIx, decodeProjectMetadata, decodeReputation, decodeReputationConfig, discHex, fetchAllSpaces, fetchConfig, fetchProjectMetadata, fetchReputation, fetchReputationsForDaoSeason, getConfigPda, getProjectMetaPda, getReputationPda, ixDiscriminator };
+export { type DelegateAccount, type ProjectMetadataAccount, type RepRow, type ReputationAccount, type ReputationConfigAccount, VINE_REP_PROGRAM_ID, type VineSpace, accountDiscriminator, buildAddDelegateIx, buildAddReputationIx, buildAddReputationPointsIx, buildAdminCloseAnyIx, buildCloseConfigIx, buildCloseReputationIx, buildInitializeConfigIx, buildRemoveDelegateIx, buildResetReputationIx, buildSetAuthorityIx, buildSetDecayBpsIx, buildSetRepMintIx, buildSetSeasonIx, buildTransferReputationIx, buildUpdateDelegateIx, buildUpsertProjectMetadataIx, decodeDelegate, decodeProjectMetadata, decodeReputation, decodeReputationConfig, discHex, fetchAllSpaces, fetchAllSpacesGPA, fetchConfig, fetchDelegate, fetchProjectMetadata, fetchReputation, fetchReputationsForDaoSeason, getConfigPda, getDelegatePda, getProjectMetaPda, getReputationPda, ixDiscriminator };

@@ -131,6 +131,21 @@ export function getReputationPda(
 }
 
 /**
+ * delegate PDA:
+ * ["delegate", configPda, delegateWallet]
+ */
+export function getDelegatePda(
+  configPda: PublicKey,
+  delegateWallet: PublicKey,
+  programId = VINE_REP_PROGRAM_ID
+) {
+  return PublicKey.findProgramAddressSync(
+    [utf8("delegate"), configPda.toBytes(), delegateWallet.toBytes()],
+    programId
+  );
+}
+
+/**
  * -----------------------------
  * Anchor discriminators (FIXED)
  * Anchor on-chain discriminators are derived from:
@@ -163,6 +178,9 @@ function ixNameOnChain(ix: string): string {
     case "setSeason": return "set_season";
     case "setDecayBps": return "set_decay_bps";
     case "setRepMint": return "set_rep_mint";
+    case "addDelegate": return "add_delegate";
+    case "updateDelegate": return "update_delegate";
+    case "removeDelegate": return "remove_delegate";
     case "addReputation": return "add_reputation";
     case "resetReputation": return "reset_reputation";
     case "transferReputation": return "transfer_reputation";
@@ -234,9 +252,18 @@ export type ProjectMetadataAccount = {
   bump: number; // u8
 };
 
+export type DelegateAccount = {
+  version: number; // u8
+  config: PublicKey;
+  delegate: PublicKey;
+  canAward: boolean;
+  canReset: boolean;
+  bump: number; // u8
+};
+
 /**
  * -----------------------------
- * Decoders (your existing ones are fine)
+ * Decoders
  * -----------------------------
  */
 
@@ -319,6 +346,31 @@ export async function decodeProjectMetadata(
   return { version, daoId, metadataUri, bump };
 }
 
+export async function decodeDelegate(
+  dataIn: Uint8Array | Buffer
+): Promise<DelegateAccount> {
+  const data = toU8(dataIn);
+  const disc = await accountDiscriminator("Delegate");
+  if (data.length < 8) throw new Error("Delegate data too small");
+  if (!u8eq(data.subarray(0, 8), disc)) {
+    throw new Error("Not a Delegate account (bad discriminator)");
+  }
+
+  // Delegate::SIZE = 70 bytes (1 + 32 + 32 + 1 + 1 + 1 + 2)
+  if (data.length < 78) throw new RangeError("Delegate data out of bounds");
+
+  let o = 8;
+  const version = data[o]; o += 1;
+
+  const config = new PublicKey(data.subarray(o, o + 32)); o += 32;
+  const delegate = new PublicKey(data.subarray(o, o + 32)); o += 32;
+  const canAward = data[o] !== 0; o += 1;
+  const canReset = data[o] !== 0; o += 1;
+  const bump = data[o]; o += 1;
+
+  return { version, config, delegate, canAward, canReset, bump };
+}
+
 /**
  * -----------------------------
  * Fetch helpers
@@ -352,6 +404,17 @@ export async function fetchReputation(
   return decodeReputation(ai.data as any);
 }
 
+export async function fetchDelegate(
+  conn: Connection,
+  configPda: PublicKey,
+  delegateWallet: PublicKey
+) {
+  const [delegatePda] = getDelegatePda(configPda, delegateWallet);
+  const ai = await conn.getAccountInfo(delegatePda);
+  if (!ai?.data) return null;
+  return decodeDelegate(ai.data as any);
+}
+
 /**
  * -----------------------------
  * Space discovery (SAFE + composable)
@@ -371,6 +434,62 @@ export type VineSpace = {
 };
 
 export async function fetchAllSpaces(
+  conn: Connection,
+  programId: PublicKey = VINE_REP_PROGRAM_ID
+): Promise<VineSpace[]> {
+  const disc = await accountDiscriminator("ReputationConfig");
+  const disc58 = bs58.encode(disc);
+
+  const cfg: GetProgramAccountsConfig = {
+    encoding: "base64",
+    filters: [
+      { dataSize: 113 }, // ✅ 8 + ReputationConfig::SIZE (105)
+      { memcmp: { offset: 0, bytes: disc58 } },
+    ],
+  };
+
+  const accts = await conn.getProgramAccounts(programId, cfg);
+
+  const out: VineSpace[] = [];
+
+  for (const a of accts) {
+    try {
+      const raw = a.account.data as unknown as Uint8Array;
+      if (!raw || raw.length < 8) continue;
+
+      // decode (will re-check discriminator too)
+      const cfgAcct = await decodeReputationConfig(raw);
+
+      // verify PDA matches contents (prevents false positives)
+      const [expected] = getConfigPda(cfgAcct.daoId, programId);
+      if (!expected.equals(a.pubkey)) continue;
+
+      out.push({
+        version: cfgAcct.version,
+        daoId: cfgAcct.daoId,
+        authority: cfgAcct.authority,
+        repMint: cfgAcct.repMint,
+        currentSeason: cfgAcct.currentSeason,
+        decayBps: cfgAcct.decayBps,
+        configPda: a.pubkey,
+      });
+    } catch {
+      // ignore bad accounts
+    }
+  }
+
+  // de-dupe by daoId (keep highest season)
+  const byDao = new Map<string, VineSpace>();
+  for (const s of out) {
+    const k = s.daoId.toBase58();
+    const prev = byDao.get(k);
+    if (!prev || s.currentSeason > prev.currentSeason) byDao.set(k, s);
+  }
+
+  return Array.from(byDao.values());
+}
+
+export async function fetchAllSpacesGPA(
   conn: Connection,
   programId: PublicKey = VINE_REP_PROGRAM_ID
 ): Promise<VineSpace[]> {
@@ -426,7 +545,6 @@ export async function fetchAllSpaces(
 /**
  * -----------------------------
  * Instruction builders
- * (NO CHANGE needed besides fixed ixDiscriminator above)
  * -----------------------------
  */
 
@@ -493,11 +611,6 @@ export async function buildUpsertProjectMetadataIx(args: {
     data: Buffer.from(data),
   });
 }
-
-/**
- * Keep the rest of your builders exactly as-is.
- * They will start working once ixDiscriminator() hashes the on-chain snake_case name.
- */
 
 export async function buildSetAuthorityIx(args: {
   daoId: PublicKey;
@@ -604,6 +717,111 @@ export async function buildSetRepMintIx(args: {
   });
 }
 
+/**
+ * -----------------------------
+ * Delegate instruction builders
+ * -----------------------------
+ */
+
+export async function buildAddDelegateIx(args: {
+  daoId: PublicKey;
+  authority: PublicKey;     // signer (must be config.authority)
+  delegateWallet: PublicKey; // wallet being granted permissions
+  canAward: boolean;
+  canReset: boolean;
+  payer: PublicKey;         // signer
+  programId?: PublicKey;
+}) {
+  const programId = args.programId ?? VINE_REP_PROGRAM_ID;
+  const disc = await ixDiscriminator("addDelegate");
+
+  // Instruction data: discriminator + can_award(bool) + can_reset(bool)
+  const data = new Uint8Array(8 + 1 + 1);
+  data.set(disc, 0);
+  data[8] = args.canAward ? 1 : 0;
+  data[9] = args.canReset ? 1 : 0;
+
+  const [configPda] = getConfigPda(args.daoId, programId);
+  const [delegatePda] = getDelegatePda(configPda, args.delegateWallet, programId);
+
+  return new TransactionInstruction({
+    programId,
+    keys: [
+      { pubkey: configPda, isSigner: false, isWritable: false },
+      { pubkey: args.authority, isSigner: true, isWritable: false },
+      { pubkey: args.delegateWallet, isSigner: false, isWritable: false },
+      { pubkey: delegatePda, isSigner: false, isWritable: true },
+      { pubkey: args.payer, isSigner: true, isWritable: true },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    ],
+    data: Buffer.from(data),
+  });
+}
+
+export async function buildUpdateDelegateIx(args: {
+  daoId: PublicKey;
+  authority: PublicKey;     // signer (must be config.authority)
+  delegateWallet: PublicKey; // the delegate being updated
+  canAward: boolean;
+  canReset: boolean;
+  programId?: PublicKey;
+}) {
+  const programId = args.programId ?? VINE_REP_PROGRAM_ID;
+  const disc = await ixDiscriminator("updateDelegate");
+
+  const data = new Uint8Array(8 + 1 + 1);
+  data.set(disc, 0);
+  data[8] = args.canAward ? 1 : 0;
+  data[9] = args.canReset ? 1 : 0;
+
+  const [configPda] = getConfigPda(args.daoId, programId);
+  const [delegatePda] = getDelegatePda(configPda, args.delegateWallet, programId);
+
+  return new TransactionInstruction({
+    programId,
+    keys: [
+      { pubkey: configPda, isSigner: false, isWritable: false },
+      { pubkey: args.authority, isSigner: true, isWritable: false },
+      { pubkey: delegatePda, isSigner: false, isWritable: true },
+    ],
+    data: Buffer.from(data),
+  });
+}
+
+export async function buildRemoveDelegateIx(args: {
+  daoId: PublicKey;
+  authority: PublicKey;     // signer (must be config.authority)
+  delegateWallet: PublicKey; // the delegate being removed
+  recipient: PublicKey;      // where to send reclaimed lamports
+  programId?: PublicKey;
+}) {
+  const programId = args.programId ?? VINE_REP_PROGRAM_ID;
+  const disc = await ixDiscriminator("removeDelegate");
+
+  const data = new Uint8Array(8);
+  data.set(disc, 0);
+
+  const [configPda] = getConfigPda(args.daoId, programId);
+  const [delegatePda] = getDelegatePda(configPda, args.delegateWallet, programId);
+
+  return new TransactionInstruction({
+    programId,
+    keys: [
+      { pubkey: configPda, isSigner: false, isWritable: false },
+      { pubkey: args.authority, isSigner: true, isWritable: false },
+      { pubkey: delegatePda, isSigner: false, isWritable: true },
+      { pubkey: args.recipient, isSigner: false, isWritable: true },
+    ],
+    data: Buffer.from(data),
+  });
+}
+
+/**
+ * -----------------------------
+ * Reputation instruction builders
+ * -----------------------------
+ */
+
 export type RepRow = {
   pubkey: PublicKey;
   user: PublicKey;
@@ -709,7 +927,7 @@ export async function fetchReputationsForDaoSeason(args: {
         ? decodeReputationNewLayout(raw)
         : await decodeReputation(raw); // your existing old-layout decoder
 
-      // HARD FILTER: PDA must match this DAO’s configPda + season + user
+      // HARD FILTER: PDA must match this DAO's configPda + season + user
       const [expected] = getReputationPda(configPda, decoded.user, season, programId);
       if (!expected.equals(a.pubkey)) continue;
 
@@ -981,12 +1199,13 @@ export async function buildAdminCloseAnyIx(args: {
 }
 
 export async function buildTransferReputationIx(args: {
+  conn: Connection;
   daoId: PublicKey;
   authority: PublicKey; // signer
   payer: PublicKey; // signer
   oldWallet: PublicKey;
   newWallet: PublicKey;
-  season: number;
+  season?: number; // optional: must match cfg.currentSeason if provided
   programId?: PublicKey;
 }) {
   const programId = args.programId ?? VINE_REP_PROGRAM_ID;
@@ -996,8 +1215,25 @@ export async function buildTransferReputationIx(args: {
   data.set(disc, 0);
 
   const [configPda] = getConfigPda(args.daoId, programId);
-  const [repFrom] = getReputationPda(configPda, args.oldWallet, args.season, programId);
-  const [repTo] = getReputationPda(configPda, args.newWallet, args.season, programId);
+
+  const ai = await args.conn.getAccountInfo(configPda);
+  if (!ai?.data) throw new Error("Config PDA not found for this DAO.");
+
+  const cfg = await decodeReputationConfig(ai.data as any);
+  const cfgSeason = Number(cfg.currentSeason);
+  if (!Number.isFinite(cfgSeason) || cfgSeason < 0 || cfgSeason > 65535) {
+    throw new Error(`Invalid config.currentSeason: ${cfgSeason}`);
+  }
+
+  const season = args.season == null ? cfgSeason : Number(args.season);
+  if (season !== cfgSeason) {
+    throw new Error(
+      `SeasonMismatch (client): provided season=${season} but config.currentSeason=${cfgSeason}`
+    );
+  }
+
+  const [repFrom] = getReputationPda(configPda, args.oldWallet, season, programId);
+  const [repTo] = getReputationPda(configPda, args.newWallet, season, programId);
 
   return new TransactionInstruction({
     programId,
